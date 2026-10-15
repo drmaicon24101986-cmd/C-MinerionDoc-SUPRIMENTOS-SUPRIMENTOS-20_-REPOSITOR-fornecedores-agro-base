@@ -1,0 +1,191 @@
+
+name: Base Receita CNPJ
+# Baixa a base mais recente de CNPJ da Receita Federal (dados abertos), separa as
+# empresas ativas (sem MEI) por estado e publica em Releases deste repositorio.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mes:
+        description: "Mes da base (AAAA-MM). Deixe vazio para pegar a mais recente"
+        required: false
+        default: ""
+  schedule:
+    - cron: "17 10 3,13,23 * *"
+
+permissions:
+  contents: write
+
+jobs:
+  base:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      GH_TOKEN: ${{ github.token }}
+      WORK: /home/runner/rfb
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preparar
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          mkdir -p "$WORK/tmp"
+          python3 -m pip install --quiet --break-system-packages duckdb==1.2.2 requests
+          cat > "$RUNNER_TEMP/build.py" <<'PYEOF'
+          import os, re, sys, glob, shutil, subprocess, concurrent.futures as cf
+          import requests, duckdb
+
+          TOK = os.environ.get("RFB_TOKEN", "gn672Ad4CF8N6TK")
+          HOST = "https://arquivos.receitafederal.gov.br"
+          BASE = HOST + "/public.php/webdav/Dados/Cadastros/CNPJ/"
+          WORK = os.environ.get("WORK", "/mnt/rfb")
+          os.makedirs(WORK, exist_ok=True)
+
+          def propfind(url):
+              r = requests.request("PROPFIND", url, auth=(TOK, ""), headers={"Depth": "1"}, timeout=180)
+              r.raise_for_status()
+              return re.findall(r"<[a-zA-Z]*:?href>([^<]+)</[a-zA-Z]*:?href>", r.text)
+
+          def latest_month():
+              meses = sorted({m for h in propfind(BASE) for m in re.findall(r"/(\d{4}-\d{2})/?$", h)})
+              return meses[-1]
+
+          def files_of(mes):
+              return [h for h in propfind(BASE + mes + "/") if h.lower().endswith(".zip")]
+
+          def download(href):
+              name = href.rstrip("/").split("/")[-1]
+              dest = os.path.join(WORK, name)
+              for _ in range(3):
+                  rc = subprocess.call(["curl", "-sS", "-L", "--fail", "--retry", "15", "--retry-delay", "30",
+                                        "--retry-all-errors", "-C", "-", "-u", TOK + ":", "-o", dest, HOST + href])
+                  if rc == 0:
+                      return dest
+              raise SystemExit("falha ao baixar " + name)
+
+          def to_csv(zipf):
+              out = zipf[:-4] + ".csv"
+              subprocess.check_call(f"unzip -p '{zipf}' | iconv -f latin1 -t utf-8//IGNORE > '{out}'", shell=True)
+              if not os.environ.get('KEEPZIP'): os.remove(zipf)
+              return out
+
+          def rd(csv, names):
+              cols = "{" + ",".join(f"'{n}':'VARCHAR'" for n in names) + "}"
+              return (f"read_csv('{csv}', delim=';', quote='\"', escape='\"', header=false, columns={cols}, "
+                      f"ignore_errors=true, null_padding=true, strict_mode=false, auto_detect=false, max_line_size=10000000)")
+
+          EST = ["cnpj_basico","cnpj_ordem","cnpj_dv","mf","nome_fantasia","situacao","data_situacao","motivo","cidade_ext","pais",
+                 "inicio","cnae","cnae2","tipo_logr","logradouro","numero","complemento","bairro","cep","uf","municipio",
+                 "ddd1","tel1","ddd2","tel2","ddd_fax","fax","email","sit_esp","data_sit_esp"]
+          EMP = ["cnpj_basico","razao","natureza","qual_resp","capital","porte","ente"]
+          SIM = ["cnpj_basico","simples","data_simples","exc_simples","mei","data_mei","exc_mei"]
+          SOC = ["cnpj_basico","tipo","nome","doc","qual","entrada","pais","rep","nome_rep","qual_rep","faixa"]
+          TAB = ["codigo","descricao"]
+
+          def main(mes, local=None):
+              hrefs = files_of(mes) if not local else local
+              group = lambda p: [h for h in hrefs if re.search(p, h.split("/")[-1], re.I)]
+              db = duckdb.connect(os.path.join(WORK, "rfb.duckdb"))
+              db.execute(f"SET memory_limit='11GB'; SET temp_directory='{WORK}/tmp'; SET preserve_insertion_order=false")
+              get = (lambda h: h) if local else download
+
+              def load(pattern, table, names, select, where="", par=3):
+                  hs = group(pattern)
+                  print(table, len(hs), "arquivos", flush=True)
+                  first = True
+                  with cf.ThreadPoolExecutor(par) as ex:
+                      for z in ex.map(get, hs):
+                          c = to_csv(z) if z.endswith(".zip") else z
+                          src = rd(c, names)
+                          if first and not db.execute(f"select count(*) from information_schema.tables where table_name='{table}'").fetchone()[0]:
+                              db.execute(f"create table {table} as select {select} from {src} {where}")
+                          else:
+                              db.execute(f"insert into {table} select {select} from {src} {where}")
+                          first = False
+                          if not local: os.remove(c)
+                          print(" ", table, db.execute(f"select count(*) from {table}").fetchone()[0], flush=True)
+
+              load(r"^Municipios", "mun", TAB, "*")
+              load(r"^Qualificacoes", "qual", TAB, "*")
+              load(r"^Naturezas", "nat", TAB, "*")
+              load(r"^Cnaes", "cnaes", TAB, "*")
+              load(r"^Estabelecimentos", "est", EST,
+                   "cnpj_basico,cnpj_ordem,cnpj_dv,mf,nome_fantasia,inicio,cnae,cnae2,tipo_logr,logradouro,numero,complemento,bairro,cep,uf,municipio,ddd1,tel1,ddd2,tel2,email",
+                   "where situacao='02'")
+              db.execute("create table keep as select distinct cnpj_basico from est")
+              load(r"^Simples", "sim", SIM, "cnpj_basico,simples,mei",
+                   "where cnpj_basico in (select cnpj_basico from keep)", par=1)
+              load(r"^Empresas", "emp", EMP, "cnpj_basico,razao,natureza,capital,porte",
+                   "where cnpj_basico in (select cnpj_basico from keep)")
+              db.execute("create table keep2 as select k.cnpj_basico from keep k left join sim s using(cnpj_basico) where coalesce(s.mei,'N')<>'S'")
+              load(r"^Socios", "soc", SOC, "cnpj_basico,tipo,nome,qual,entrada,faixa",
+                   "where cnpj_basico in (select cnpj_basico from keep2)")
+
+              out = os.path.join(WORK, "out"); shutil.rmtree(out, ignore_errors=True)
+              db.execute(f"""COPY (
+                select e.uf, e.cnpj_basico||e.cnpj_ordem||e.cnpj_dv as cnpj, p.razao, e.nome_fantasia as fantasia,
+                  e.cnae, e.cnae2, p.natureza, n.descricao as natureza_desc, p.porte, p.capital,
+                  s.simples, s.mei, e.inicio, e.mf, m.descricao as municipio, e.municipio as cod_mun,
+                  e.tipo_logr, e.logradouro, e.numero, e.complemento, e.bairro, e.cep,
+                  e.ddd1, e.tel1, e.ddd2, e.tel2, e.email
+                from est e join keep2 k using(cnpj_basico)
+                left join emp p using(cnpj_basico) left join sim s using(cnpj_basico)
+                left join mun m on m.codigo=e.municipio left join nat n on n.codigo=p.natureza
+                where coalesce(e.uf,'')<>'' and e.uf<>'EX'
+              ) TO '{out}' (FORMAT csv, DELIMITER '\t', HEADER, COMPRESSION gzip, PARTITION_BY (uf))""")
+              final = os.path.join(WORK, "final"); shutil.rmtree(final, ignore_errors=True); os.makedirs(final)
+              for d in glob.glob(out + "/uf=*"):
+                  uf = d.split("=")[-1]
+                  parts = sorted(glob.glob(d + "/*.csv.gz"))
+                  dest = os.path.join(final, f"empresas_{uf}.csv.gz")
+                  if len(parts) == 1:
+                      shutil.move(parts[0], dest)
+                  else:
+                      import gzip
+                      with gzip.open(dest, "wt", compresslevel=6) as w:
+                          for i, p in enumerate(parts):
+                              with gzip.open(p, "rt") as r:
+                                  if i: r.readline()
+                                  shutil.copyfileobj(r, w)
+              db.execute(f"""COPY (select s.cnpj_basico, s.tipo, s.nome, s.qual, q.descricao as qual_desc, s.entrada, s.faixa
+                from soc s left join qual q on q.codigo=s.qual) TO '{final}/socios.csv.gz' (FORMAT csv, DELIMITER '\t', HEADER, COMPRESSION gzip)""")
+              db.execute(f"COPY cnaes TO '{final}/cnaes.csv.gz' (FORMAT csv, DELIMITER '\t', HEADER, COMPRESSION gzip)")
+              for f in sorted(os.listdir(final)):
+                  print(f, os.path.getsize(os.path.join(final, f)))
+
+          if __name__ == "__main__":
+              if sys.argv[1] == "mes":
+                  print(os.environ.get("MES") or latest_month())
+              else:
+                  main(sys.argv[2])
+
+          PYEOF
+          df -h /
+
+      - name: Descobrir mes
+        id: m
+        env:
+          MES: ${{ inputs.mes }}
+        run: |
+          MES=$(python3 "$RUNNER_TEMP/build.py" mes)
+          echo "Base encontrada: $MES"
+          echo "mes=$MES" >> "$GITHUB_OUTPUT"
+          if gh release view "base-$MES" >/dev/null 2>&1; then echo "existe=1" >> "$GITHUB_OUTPUT"; echo "Ja publicada."; fi
+
+      - name: Baixar e processar
+        if: steps.m.outputs.existe != '1'
+        run: python3 "$RUNNER_TEMP/build.py" build "${{ steps.m.outputs.mes }}"
+
+      - name: Publicar
+        if: steps.m.outputs.existe != '1'
+        run: |
+          MES="${{ steps.m.outputs.mes }}"
+          gh release create "base-$MES" "$WORK"/final/* --title "Receita Federal $MES" \
+            --notes "Empresas ativas (sem MEI) por estado, socios e CNAEs. Fonte: dados abertos do CNPJ, Receita Federal, $MES."
+          echo "$MES" > ultima_base.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ultima_base.txt
+          git commit -m "Base da Receita $MES" && git push || true
+
