@@ -1,4 +1,4 @@
-yaml
+
 name: Empresas de capital aberto (CVM)
 # Baixa os dados abertos da CVM (cadastro + DFP) e publica o faturamento,
 # lucro, patrimonio e divida das empresas de capital aberto em Releases.
