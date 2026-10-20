@@ -1,0 +1,135 @@
+name: Fazendas do CAR (SICAR)
+# Baixa do GeoServer publico do SICAR (Servico Florestal Brasileiro) todos os imoveis rurais
+# de cada estado e publica em Releases uma tabela leve por estado:
+# codigo CAR, situacao, area (ha), modulos fiscais, tipo, municipio IBGE e um ponto
+# dentro da fazenda (latitude/longitude) para tracar a rota.
+# Dados publicos, sem nome de dono (o SICAR nao publica).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ufs:
+        description: "Estados (separados por virgula). Deixe ALL para o Brasil inteiro."
+        default: "MT"
+  schedule:
+    - cron: "17 6 1 */3 *"
+
+permissions:
+  contents: write
+
+jobs:
+  plano:
+    runs-on: ubuntu-latest
+    outputs:
+      ufs: ${{ steps.p.outputs.ufs }}
+    steps:
+      - id: p
+        run: |
+          U="${{ github.event.inputs.ufs || 'ALL' }}"
+          if [ "$U" = "ALL" ]; then U="MT,MS,GO,RO,PA,TO,MA,PI,BA,MG,SP,PR,SC,RS,RJ,ES,DF,AC,AM,RR,AP,CE,RN,PB,PE,AL,SE"; fi
+          echo "ufs=$(echo "$U" | tr -d ' ' | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read().strip().split(",")))')" >> "$GITHUB_OUTPUT"
+
+  estado:
+    needs: plano
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        uf: ${{ fromJson(needs.plano.outputs.ufs) }}
+    steps:
+      - run: pip install shapely==2.0.6
+      - name: Baixar ${{ matrix.uf }}
+        env:
+          UF: ${{ matrix.uf }}
+        run: |
+          python3 - <<'PYEOF'
+          import gzip, json, os, ssl, time, threading, urllib.parse, urllib.request
+          from queue import Queue, Empty
+          from shapely.geometry import shape
+          UF = os.environ["UF"]
+          WFS = "https://geoserver.car.gov.br/geoserver/sicar/wfs"
+          CTX = ssl.create_default_context(); CTX.set_ciphers("DEFAULT@SECLEVEL=1")
+          def fetch(url, tries=7):
+              err = None
+              for i in range(tries):
+                  try:
+                      rq = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                      with urllib.request.urlopen(rq, timeout=180, context=CTX) as r:
+                          b = r.read()
+                          return gzip.decompress(b) if b[:2] == b"\x1f\x8b" else b
+                  except Exception as e:
+                      err = e; time.sleep(min(90, 3 * 2 ** i))
+              raise err
+          muns = json.loads(fetch(f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{UF}/municipios"))
+          names = {m["id"]: m["nome"] for m in muns}
+          q = Queue()
+          for m in names: q.put(m)
+          out, lock, fails = [], threading.Lock(), []
+          def cl(s): return str(s or "").replace("\t", " ").replace("\n", " ").strip()
+          def work():
+              while True:
+                  try: mun = q.get_nowait()
+                  except Empty: return
+                  last = None
+                  try:
+                      while True:
+                          cql = f"cod_municipio_ibge={mun}" + (f" AND cod_imovel > '{last}'" if last else "")
+                          p = {"service": "WFS", "version": "2.0.0", "request": "GetFeature",
+                               "typeNames": f"sicar:sicar_imoveis_{UF.lower()}", "outputFormat": "application/json",
+                               "count": 5000, "sortBy": "cod_imovel", "cql_filter": cql}
+                          feats = json.loads(fetch(WFS + "?" + urllib.parse.urlencode(p)))["features"]
+                          rows = []
+                          for f in feats:
+                              pr = f["properties"]; lat = lon = ""
+                              try:
+                                  g = shape(f["geometry"]); pt = g.representative_point()
+                                  lon, lat = f"{pt.x:.5f}", f"{pt.y:.5f}"
+                              except Exception:
+                                  pass
+                              area = pr.get("area")
+                              rows.append("\t".join([cl(pr.get("cod_imovel")), cl(pr.get("status_imovel")),
+                                  f"{float(area):.1f}" if area not in (None, "") else "", cl(pr.get("m_fiscal")),
+                                  cl(pr.get("tipo_imovel")), str(mun), lat, lon, cl(pr.get("condicao"))[:60],
+                                  cl(pr.get("data_atualizacao"))[:10]]))
+                          with lock: out.extend(rows)
+                          if len(feats) < 5000: break
+                          last = feats[-1]["properties"]["cod_imovel"]; time.sleep(0.3)
+                  except Exception as e:
+                      with lock: fails.append(f"{mun}: {e}")
+          ts = [threading.Thread(target=work) for _ in range(3)]
+          [t.start() for t in ts]; [t.join() for t in ts]
+          out.sort()
+          with gzip.open(f"car_{UF}.tsv.gz", "wt", encoding="utf-8") as f:
+              f.write("cod_imovel\tstatus\tarea_ha\tmod_fiscal\ttipo\tibge\tlat\tlon\tcondicao\tatualizado\n")
+              f.write("\n".join(out) + "\n")
+          with open(f"mun_{UF}.tsv", "w", encoding="utf-8") as f:
+              for k, v in names.items(): f.write(f"{k}\t{v}\n")
+          print(UF, len(out), "imoveis;", len(fails), "municipios com falha")
+          if fails: open(f"falhas_{UF}.txt", "w").write("\n".join(fails))
+          PYEOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: car-${{ matrix.uf }}
+          path: |
+            car_*.tsv.gz
+            mun_*.tsv
+            falhas_*.txt
+          if-no-files-found: error
+
+  publicar:
+    needs: estado
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: arq
+          merge-multiple: true
+      - run: |
+          ls -la arq
+          TAG="car-$(date +%Y%m%d-%H%M)"
+          gh release create "$TAG" arq/* --repo "$GITHUB_REPOSITORY" --title "Fazendas do CAR $(date +%d/%m/%Y)" --notes "Imoveis rurais do SICAR por estado (dados publicos, sem proprietario)."
