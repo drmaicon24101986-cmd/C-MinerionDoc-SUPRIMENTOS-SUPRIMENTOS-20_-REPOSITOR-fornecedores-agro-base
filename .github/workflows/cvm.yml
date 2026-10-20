@@ -1,0 +1,86 @@
+yaml
+name: Empresas de capital aberto (CVM)
+# Baixa os dados abertos da CVM (cadastro + DFP) e publica o faturamento,
+# lucro, patrimonio e divida das empresas de capital aberto em Releases.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "37 9 5 * *"
+
+permissions:
+  contents: write
+
+jobs:
+  cvm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Baixar e processar
+        run: |
+          python3 - <<'PYEOF'
+          import csv, io, json, gzip, zipfile, urllib.request, datetime, re
+          B = "https://dados.cvm.gov.br/dados/CIA_ABERTA/"
+          def get(u):
+              for _ in range(4):
+                  try:
+                      return urllib.request.urlopen(u, timeout=300).read()
+                  except Exception as e:
+                      err = e
+              raise err
+          def rows(b):
+              return list(csv.DictReader(io.StringIO(b.decode("latin1")), delimiter=";"))
+          cad = {}
+          for r in rows(get(B + "CAD/DADOS/cad_cia_aberta.csv")):
+              c = re.sub(r"\D", "", r.get("CNPJ_CIA", ""))
+              if len(c) == 14:
+                  cad[c] = dict(nm=(r.get("DENOM_COMERC") or r.get("DENOM_SOCIAL") or "").strip(),
+                                sit=r.get("SIT", ""), setor=r.get("SETOR_ATIV", ""))
+          print("cadastro", len(cad))
+          out = {}
+          y0 = datetime.date.today().year
+          for ano in (y0 - 3, y0 - 2, y0 - 1):
+              try:
+                  z = zipfile.ZipFile(io.BytesIO(get(B + f"DOC/DFP/DADOS/dfp_cia_aberta_{ano}.zip")))
+              except Exception as e:
+                  print("sem DFP", ano, e); continue
+              names = z.namelist()
+              def load(kind):
+                  data = {}
+                  for tipo in ("con", "ind"):
+                      fn = f"dfp_cia_aberta_{kind}_{tipo}_{ano}.csv"
+                      if fn not in names: continue
+                      for r in rows(z.read(fn)):
+                          if r.get("ORDEM_EXERC", "").upper().startswith("PEN"): continue
+                          c = re.sub(r"\D", "", r["CNPJ_CIA"])
+                          k = (c, tipo)
+                          esc = 1000 if r.get("ESCALA_MOEDA", "").upper().startswith("MIL") else 1
+                          try: v = float(r["VL_CONTA"]) * esc
+                          except: continue
+                          data.setdefault(k, {})[r["CD_CONTA"]] = v
+                  res = {}
+                  for (c, tipo), d in data.items():
+                      if tipo == "con" or c not in res: res[c] = d
+                  return res
+              dre, bpa, bpp = load("DRE"), load("BPA"), load("BPP")
+              for c, d in dre.items():
+                  a = bpa.get(c, {}); p = bpp.get(c, {})
+                  luc = d.get("3.11", d.get("3.09", d.get("3.13")))
+                  div = (p.get("2.01.04") or 0) + (p.get("2.02.01") or 0)
+                  out[c] = dict(a=str(ano), rec=d.get("3.01"), luc=luc, at=a.get("1"),
+                                pl=p.get("2.03"), div=div if (p.get("2.01.04") is not None or p.get("2.02.01") is not None) else None,
+                                nm=cad.get(c, {}).get("nm", ""), sit=cad.get(c, {}).get("sit", ""))
+              print("DFP", ano, len(dre))
+          res = {"c": out, "r": {c[:8]: v for c, v in out.items()}, "gerado": str(datetime.date.today())}
+          open("cvm.json.gz", "wb").write(gzip.compress(json.dumps(res, ensure_ascii=False).encode()))
+          print("empresas com balanco", len(out))
+          PYEOF
+      - name: Publicar
+        run: |
+          TAG="cvm-$(date +%Y%m%d)"
+          gh release delete "$TAG" -y >/dev/null 2>&1 || true
+          gh release create "$TAG" cvm.json.gz --title "CVM $(date +%d/%m/%Y)" \
+            --notes "Faturamento, lucro, patrimonio e divida das empresas de capital aberto (DFP/CVM)."
