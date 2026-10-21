@@ -1,6 +1,8 @@
-name: Precos oficiais (Conab e Cepea)
-# Baixa os precos semanais/mensais pagos ao produtor por municipio (Conab, dados abertos)
-# e os indicadores Cepea de soja e milho, e salva em data/precos/ neste repositorio.
+name: Precos oficiais (IMEA, Cepea e Conab)
+# IMEA: cotacoes publicas por regiao de MT (soja, milho, algodao, boi) - uso interno, ver termo de uso do IMEA.
+# Cepea: indicadores diarios (soja Paranagua, milho Campinas) lidos da pagina publica com navegador.
+# Conab: precos ao produtor (portal novo) - o robo tambem registra os enderecos que o portal usa.
+# Tudo e salvo em data/precos/ neste repositorio.
 
 on:
   workflow_dispatch:
@@ -16,85 +18,71 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - name: Baixar e filtrar
+      - name: Preparar
         run: |
+          pip install playwright==1.47.0
+          python3 -m playwright install --with-deps chromium
           mkdir -p data/precos
+      - name: IMEA (API publica)
+        continue-on-error: true
+        run: |
           python3 - <<'PYEOF'
-          import csv, io, gzip, json, re, ssl, urllib.request, datetime, unicodedata
-          CTX = ssl.create_default_context(); CTX.set_ciphers("DEFAULT@SECLEVEL=1")
-          UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-          NOVER = ssl.create_default_context(); NOVER.check_hostname = False; NOVER.verify_mode = ssl.CERT_NONE; NOVER.set_ciphers("DEFAULT@SECLEVEL=1")
-          AVISO = []
-          def get(u):
-              rq = urllib.request.Request(u, headers=UA)
+          import json, urllib.request, time
+          H = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Accept": "application/json"}
+          out = {}
+          for nome, cid in [("soja", 4), ("milho", 3), ("algodao", 1), ("boi", 2)]:
+              r = {}
+              for tipo in ("cotacoes", "indicadores"):
+                  u = f"https://api1.imea.com.br/api/v2/mobile/cadeias/{cid}/{tipo}"
+                  try:
+                      with urllib.request.urlopen(urllib.request.Request(u, headers=H), timeout=120) as resp:
+                          r[tipo] = json.loads(resp.read().decode("utf-8"))
+                  except Exception as e:
+                      r[tipo] = {"erro": str(e)}
+                  time.sleep(1)
+              out[nome] = r
+              print(nome, {k: (len(v) if isinstance(v, list) else v) for k, v in r.items()})
+          json.dump(out, open("data/precos/imea.json", "w"), ensure_ascii=False)
+          PYEOF
+      - name: Cepea e Conab (navegador)
+        continue-on-error: true
+        run: |
+          python3 - <<'PYEOF'
+          import json, re, datetime
+          from playwright.sync_api import sync_playwright
+          res = {"cepea": {}, "conab_requisicoes": []}
+          with sync_playwright() as p:
+              b = p.chromium.launch()
+              ctx = b.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36", locale="pt-BR")
+              pg = ctx.new_page()
+              for nome, url in [("soja_paranagua", "https://www.cepea.org.br/br/indicador/soja.aspx"), ("milho", "https://www.cepea.org.br/br/indicador/milho.aspx"), ("boi", "https://www.cepea.org.br/br/indicador/boi-gordo.aspx")]:
+                  try:
+                      pg.goto(url, timeout=90000); pg.wait_for_selector("table", timeout=90000)
+                      tabs = pg.eval_on_selector_all("table", "ts => ts.slice(0,3).map(t => [...t.rows].slice(0,12).map(r => [...r.cells].map(c => c.innerText.trim())))")
+                      res["cepea"][nome] = tabs
+                      print("cepea", nome, tabs[0][:3] if tabs else "sem tabela")
+                  except Exception as e:
+                      res["cepea"][nome] = {"erro": str(e)[:300]}; print("cepea", nome, "erro", str(e)[:200])
+              reqs = []
+              pg2 = ctx.new_page()
+              pg2.on("request", lambda r: reqs.append([r.method, r.url, (r.post_data or "")[:500]]) if r.resource_type in ("xhr", "fetch") else None)
               try:
-                  with urllib.request.urlopen(rq, timeout=300, context=CTX) as r:
-                      return r.read()
+                  pg2.goto("https://consultaprecosdemercado.conab.gov.br/#/home", timeout=90000)
+                  pg2.wait_for_timeout(15000)
+                  res["conab_texto"] = pg2.inner_text("body")[:3000]
               except Exception as e:
-                  if "CERTIFICATE" not in str(e).upper(): raise
-              try:
-                  with urllib.request.urlopen(urllib.request.Request(u.replace("https://", "http://"), headers=UA), timeout=300) as r:
-                      return r.read()
-              except Exception:
-                  pass
-              # o site da Conab esta com certificado configurado errado: dado publico, baixa sem verificar e registra aviso
-              AVISO.append(u.split("/")[2])
-              with urllib.request.urlopen(rq, timeout=300, context=NOVER) as r:
-                  return r.read()
-          def norm(s): return unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().upper().strip()
-          PROD = re.compile(r"SOJA|MILHO|SORGO|ALGOD|FEIJ|ARROZ|TRIGO|BOI|VACA|CAFE|FARELO")
-          base = "https://portaldeinformacoes.conab.gov.br/downloads/arquivos/"
-          log = {}
-          lim = (datetime.date.today() - datetime.timedelta(days=800)).isoformat()
-          for nome in ["PrecosSemanalMunicipio.txt", "PrecosMensalMunicipio.txt", "PrecosSemanalUF.txt", "PrecosMensalUF.txt"]:
-              try:
-                  b = get(base + nome)
-              except Exception as e:
-                  log[nome] = "erro: " + str(e); print(nome, e); continue
-              t = b.decode("utf-8", "replace") if b[:3] != b"\xef\xbb\xbf" else b[3:].decode("utf-8", "replace")
-              dl = ";" if t[:2000].count(";") > t[:2000].count("\t") else "\t"
-              rd = csv.reader(io.StringIO(t), delimiter=dl)
-              h = [norm(x).lower() for x in next(rd)]
-              print(nome, h)
-              ip = next((i for i, x in enumerate(h) if x.startswith("produto")), None)
-              keep = []
-              for r in rd:
-                  if len(r) != len(h): continue
-                  d = dict(zip(h, r))
-                  if ip is not None and not PROD.search(norm(r[ip])): continue
-                  dt = ""
-                  for k, v in d.items():
-                      if re.match(r"^\d{4}-\d{2}-\d{2}", v or "") or re.match(r"^\d{2}/\d{2}/\d{4}", v or ""):
-                          dt = v; break
-                  if dt:
-                      iso = dt[:10] if dt[4] == "-" else dt[6:10] + "-" + dt[3:5] + "-" + dt[0:2]
-                      if iso < lim: continue
-                  elif "ano" in d:
-                      try:
-                          if int(d["ano"]) < datetime.date.today().year - 2: continue
-                      except Exception: pass
-                  keep.append(r)
-              with gzip.open("data/precos/" + nome.replace(".txt", ".tsv.gz"), "wt", encoding="utf-8") as f:
-                  f.write("\t".join(h) + "\n")
-                  for r in keep: f.write("\t".join(x.replace("\t", " ") for x in r) + "\n")
-              log[nome] = f"{len(keep)} linhas"
-          # Indicadores Cepea (soja Paranagua, milho Campinas) - planilha publica
-          for nome, cid in [("cepea_soja_paranagua", 92), ("cepea_milho", 77), ("cepea_soja_parana", 12)]:
-              try:
-                  rq = urllib.request.Request(f"https://www.cepea.org.br/br/indicador/series/{'soja' if 'soja' in nome else 'milho'}.aspx?id={cid}", headers={**UA, "Referer": "https://www.cepea.org.br/br/indicador/soja.aspx", "Accept": "*/*", "Accept-Language": "pt-BR,pt;q=0.9"})
-                  with urllib.request.urlopen(rq, timeout=120, context=CTX) as r: b = r.read()
-                  open(f"data/precos/{nome}.xls", "wb").write(b); log[nome] = f"{len(b)} bytes"
-              except Exception as e:
-                  log[nome] = "erro: " + str(e)
-          if AVISO: log["aviso"] = "certificado HTTPS invalido em: " + ", ".join(sorted(set(AVISO))) + " (baixado mesmo assim; dado publico)"
-          log["atualizado"] = datetime.datetime.utcnow().isoformat() + "Z"
-          json.dump(log, open("data/precos/log.json", "w"), ensure_ascii=False, indent=1)
-          print(json.dumps(log, ensure_ascii=False, indent=1))
+                  res["conab_erro"] = str(e)[:300]
+              res["conab_requisicoes"] = reqs[:80]
+              print("conab requisicoes:", len(reqs)); [print(r[:2]) for r in reqs[:40]]
+              b.close()
+          res["atualizado"] = datetime.datetime.utcnow().isoformat() + "Z"
+          json.dump(res, open("data/precos/cepea_conab.json", "w"), ensure_ascii=False, indent=1)
           PYEOF
       - name: Salvar no repositorio
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -q --ignore-unmatch data/precos/*.tsv.gz data/precos/log.json
           git add data/precos
           git commit -m "Precos oficiais $(date +%Y-%m-%d)" || echo "sem mudancas"
           git push
