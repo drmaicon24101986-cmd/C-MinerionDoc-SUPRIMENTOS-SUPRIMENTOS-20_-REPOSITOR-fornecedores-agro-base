@@ -1,10 +1,10 @@
 {
- "PrecosSemanalMunicipio.txt": "erro: <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'portaldeinformacoes.conab.gov.br'. (_ssl.c:1000)>",
- "PrecosMensalMunicipio.txt": "erro: <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'portaldeinformacoes.conab.gov.br'. (_ssl.c:1000)>",
- "PrecosSemanalUF.txt": "erro: <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'portaldeinformacoes.conab.gov.br'. (_ssl.c:1000)>",
- "PrecosMensalUF.txt": "erro: <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'portaldeinformacoes.conab.gov.br'. (_ssl.c:1000)>",
+ "PrecosSemanalMunicipio.txt": "19 linhas",
+ "PrecosMensalMunicipio.txt": "19 linhas",
+ "PrecosSemanalUF.txt": "19 linhas",
+ "PrecosMensalUF.txt": "19 linhas",
  "cepea_soja_paranagua": "erro: HTTP Error 403: Forbidden",
  "cepea_milho": "erro: HTTP Error 403: Forbidden",
  "cepea_soja_parana": "erro: HTTP Error 403: Forbidden",
- "atualizado": "2026-10-21T15:20:55.041777Z"
+ "atualizado": "2026-10-21T15:25:34.975632Z"
 }
