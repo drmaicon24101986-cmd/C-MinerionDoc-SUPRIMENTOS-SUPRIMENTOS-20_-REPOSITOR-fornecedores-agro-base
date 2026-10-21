@@ -1,0 +1,173 @@
+name: Uso da terra por fazenda (CAR x MapBiomas)
+# Para cada imovel do CAR, cruza o desenho da fazenda com o mapa de satelite do MapBiomas
+# e calcula quanto da area e soja, algodao, cana, arroz, outras lavouras, pastagem,
+# floresta plantada e vegetacao nativa. Publica uma tabela por estado em Releases.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ufs:
+        description: "Estados (separados por virgula)"
+        default: "MT"
+
+permissions:
+  contents: write
+
+jobs:
+  plano:
+    runs-on: ubuntu-latest
+    outputs:
+      ufs: ${{ steps.p.outputs.ufs }}
+    steps:
+      - id: p
+        run: |
+          U="${{ github.event.inputs.ufs || 'MT' }}"
+          echo "ufs=$(echo "$U" | tr -d ' ' | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read().strip().split(",")))')" >> "$GITHUB_OUTPUT"
+
+  estado:
+    needs: plano
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        uf: ${{ fromJson(needs.plano.outputs.ufs) }}
+    steps:
+      - run: pip install rasterio==1.4.3 shapely==2.0.6 numpy
+      - name: Uso da terra ${{ matrix.uf }}
+        env:
+          UF: ${{ matrix.uf }}
+        run: |
+          python3 - <<'PYEOF'
+          import gzip, json, os, ssl, time, threading, urllib.parse, urllib.request, math
+          from queue import Queue, Empty
+          os.environ["GDAL_HTTP_MAX_RETRY"] = "8"; os.environ["GDAL_HTTP_RETRY_DELAY"] = "5"; os.environ["GDAL_DISABLE_READDIR_ON_OPEN"] = "EMPTY_DIR"
+          import numpy as np, rasterio
+          from rasterio.enums import Resampling
+          from rasterio.windows import from_bounds
+          from rasterio.features import geometry_mask
+          from rasterio.transform import Affine
+          from shapely.geometry import shape, mapping
+          UF = os.environ["UF"]
+          CTX = ssl.create_default_context(); CTX.set_ciphers("DEFAULT@SECLEVEL=1")
+          def fetch(url, tries=7):
+              err = None
+              for i in range(tries):
+                  try:
+                      rq = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                      with urllib.request.urlopen(rq, timeout=180, context=CTX) as r:
+                          b = r.read()
+                          return gzip.decompress(b) if b[:2] == b"\x1f\x8b" else b
+                  except Exception as e:
+                      err = e; time.sleep(min(90, 3 * 2 ** i))
+              raise err
+          # ---- 1) mapa do MapBiomas (tenta a colecao mais nova primeiro)
+          G = "https://storage.googleapis.com/mapbiomas-public/initiatives/brasil/"
+          CANDS = [(G + "collection11/lulc/coverage/brazil_coverage/brazil_coverage-col11_2025.tif", "MapBiomas Colecao 11 - 2025")] + \
+                  [(G + f"collection_10/lulc/coverage/brazil_coverage_{y}.tif", f"MapBiomas Colecao 10 - {y}") for y in (2024, 2023)] + \
+                  [(G + f"collection_9/lulc/coverage/brasil_coverage_{y}.tif", f"MapBiomas Colecao 9 - {y}") for y in (2023,)] + \
+                  [(G + "collection_8/lclu/coverage/brasil_coverage_2022.tif", "MapBiomas Colecao 8 - 2022")]
+          ufbox = None
+          muns = json.loads(fetch(f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{UF}/municipios"))
+          names = {m["id"]: m["nome"] for m in muns}
+          BOX = {"MT": (-61.7, -18.1, -50.1, -7.3), "MS": (-58.2, -24.1, -50.9, -17.1), "GO": (-53.3, -19.6, -45.9, -12.3), "RO": (-66.9, -13.8, -59.7, -7.9),
+                 "PA": (-58.9, -9.9, -46.0, 2.6), "TO": (-50.8, -13.5, -45.6, -5.1), "MA": (-48.8, -10.3, -41.7, -1.0), "PI": (-45.99, -10.95, -40.3, -2.7),
+                 "BA": (-46.7, -18.4, -37.3, -8.5), "MG": (-51.1, -22.95, -39.8, -14.2), "SP": (-53.2, -25.4, -44.1, -19.7), "PR": (-54.7, -26.8, -48.0, -22.5),
+                 "SC": (-53.9, -29.4, -48.3, -25.9), "RS": (-57.7, -33.8, -49.6, -27.0), "DF": (-48.3, -16.1, -47.3, -15.5)}
+          box = BOX.get(UF)
+          if not box: raise SystemExit("Estado sem caixa definida: " + UF)
+          src = fonte = None
+          for url, nome in CANDS:
+              try:
+                  src = rasterio.open("/vsicurl/" + url); fonte = nome; break
+              except Exception as e:
+                  print("nao abriu", url, e)
+          if src is None: raise SystemExit("Nenhum mapa do MapBiomas acessivel")
+          print("Fonte:", fonte, src.width, src.height, src.res)
+          F = 2  # le em 60 m (metade da resolucao) para caber na memoria
+          win = from_bounds(*box, transform=src.transform).round_offsets().round_lengths()
+          shp = (max(1, int(win.height // F)), max(1, int(win.width // F)))
+          A = src.read(1, window=win, out_shape=shp, resampling=Resampling.nearest)
+          T = src.window_transform(win) * Affine.scale(win.width / shp[1], win.height / shp[0])
+          print("Mapa lido:", A.shape)
+          # grupos de classes (legenda MapBiomas)
+          GR = {"so": [39], "al": [62], "ca": [20], "ar": [40], "lt": [41, 19, 18], "pe": [36, 46, 47, 48, 35], "pa": [15], "mo": [21],
+                "si": [9], "nv": [3, 4, 5, 6, 11, 12, 49, 50, 13, 32], "ag": [33, 31]}
+          LUT = np.zeros(256, dtype=np.uint8); KEYS = list(GR)
+          for k, (g, cs) in enumerate(GR.items(), 1):
+              for c in cs: LUT[c] = k
+          inv = ~T
+          def uso(geom):
+              g = shape(geom); x0, y0, x1, y1 = g.bounds
+              c0, r0 = inv * (x0, y1); c1, r1 = inv * (x1, y0)
+              c0, r0 = max(0, int(math.floor(c0))), max(0, int(math.floor(r0)))
+              c1, r1 = min(A.shape[1], int(math.ceil(c1)) + 1), min(A.shape[0], int(math.ceil(r1)) + 1)
+              if c1 <= c0 or r1 <= r0: return ""
+              sub = A[r0:r1, c0:c1]; st = T * Affine.translation(c0, r0)
+              try:
+                  m = geometry_mask([mapping(g)], out_shape=sub.shape, transform=st, invert=True, all_touched=sub.size < 400)
+              except Exception:
+                  return ""
+              v = LUT[sub[m]]
+              if v.size == 0: return ""
+              cnt = np.bincount(v, minlength=len(KEYS) + 1); tot = cnt.sum()
+              parts = [f"{KEYS[k-1]}:{round(100*cnt[k]/tot)}" for k in range(1, len(KEYS) + 1) if cnt[k] * 100 >= tot * 2]
+              return ",".join(parts)
+          # ---- 2) desenho das fazendas no CAR, municipio por municipio
+          WFS = "https://geoserver.car.gov.br/geoserver/sicar/wfs"
+          q = Queue(); [q.put(m) for m in names]
+          out, lock, fails = [], threading.Lock(), []
+          def work():
+              while True:
+                  try: mun = q.get_nowait()
+                  except Empty: return
+                  last = None
+                  try:
+                      while True:
+                          cql = f"cod_municipio_ibge={mun}" + (f" AND cod_imovel > '{last}'" if last else "")
+                          p = {"service": "WFS", "version": "2.0.0", "request": "GetFeature", "typeNames": f"sicar:sicar_imoveis_{UF.lower()}",
+                               "outputFormat": "application/json", "count": 5000, "sortBy": "cod_imovel", "cql_filter": cql}
+                          feats = json.loads(fetch(WFS + "?" + urllib.parse.urlencode(p)))["features"]
+                          rows = []
+                          for f in feats:
+                              try: u = uso(f["geometry"])
+                              except Exception: u = ""
+                              rows.append(f["properties"]["cod_imovel"] + "\t" + u)
+                          with lock: out.extend(rows)
+                          if len(feats) < 5000: break
+                          last = feats[-1]["properties"]["cod_imovel"]; time.sleep(0.3)
+                  except Exception as e:
+                      with lock: fails.append(f"{mun}: {e}")
+          ts = [threading.Thread(target=work) for _ in range(3)]
+          [t.start() for t in ts]; [t.join() for t in ts]
+          out.sort()
+          with gzip.open(f"uso_{UF}.tsv.gz", "wt", encoding="utf-8") as f:
+              f.write(f"# fonte: {fonte} | so=soja al=algodao ca=cana ar=arroz lt=outras lavouras temporarias pe=lavouras perenes pa=pastagem mo=mosaico de usos si=floresta plantada nv=vegetacao nativa ag=agua (percentual da area)\n")
+              f.write("\n".join(out) + "\n")
+          print(UF, len(out), "imoveis;", len(fails), "municipios com falha")
+          if fails: open(f"falhas_uso_{UF}.txt", "w").write("\n".join(fails))
+          PYEOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uso-${{ matrix.uf }}
+          path: |
+            uso_*.tsv.gz
+            falhas_uso_*.txt
+          if-no-files-found: error
+
+  publicar:
+    needs: estado
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: arq
+          merge-multiple: true
+      - run: |
+          ls -la arq
+          TAG="uso-$(date +%Y%m%d-%H%M)"
+          gh release create "$TAG" arq/* --repo "$GITHUB_REPOSITORY" --title "Uso da terra por fazenda $(date +%d/%m/%Y)" --notes "CAR x MapBiomas: percentual de soja, algodao, cana, pastagem etc. em cada imovel."
