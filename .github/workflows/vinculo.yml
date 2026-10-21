@@ -1,0 +1,101 @@
+name: Nome das fazendas (CAR x SIGEF/INCRA)
+# Usa o ponto de cada fazenda do CAR (release car-*) e o mapa de imoveis certificados do
+# SIGEF/INCRA para descobrir o nome da fazenda (nome_area), a matricula e o codigo do imovel.
+# Nao traz nome nem CPF de pessoas.
+
+on:
+  workflow_dispatch:
+    inputs:
+      uf:
+        description: "Estado"
+        default: "MT"
+
+permissions:
+  contents: write
+
+jobs:
+  vinculo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UF: ${{ github.event.inputs.uf || 'MT' }}
+    steps:
+      - run: pip install pyshp==2.3.1 shapely==2.0.6
+      - name: Pontos do CAR (ultima release car-*)
+        run: |
+          TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 --json tagName --jq '.[].tagName' | grep '^car-' | head -1)
+          echo "release: $TAG"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "car_${UF}.tsv.gz" --dir .
+          ls -la
+      - name: SIGEF do INCRA
+        run: |
+          set +e
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+          curl -sSL -A "$UA" --retry 5 --max-time 1800 -o sigef.zip "https://certificacao.incra.gov.br/csv_shp/zip/Sigef%20Brasil_${UF}.zip"
+          file sigef.zip; ls -la sigef.zip
+          if ! unzip -tq sigef.zip >/dev/null 2>&1; then
+            echo "ZIP nao veio (pode exigir login). Inicio da resposta:"; head -c 600 sigef.zip; echo
+            L=$(echo "$UF" | tr 'A-Z' 'a-z')
+            for T in certificada_sigef_particular_$L imoveiscertificados_privado_$L; do
+              curl -sSL -A "$UA" --retry 5 --max-time 1800 -o "wfs_$T.json" "https://acervofundiario.incra.gov.br/i3geo/ogc.php?tema=$T&service=WFS&version=1.0.0&request=GetFeature&typeName=$T&outputFormat=application/json"
+              ls -la "wfs_$T.json"; head -c 300 "wfs_$T.json"; echo
+            done
+          else
+            mkdir -p shp && unzip -oq sigef.zip -d shp && find shp -name '*.shp' | head
+          fi
+          true
+      - name: Cruzar
+        run: |
+          python3 - <<'PYEOF'
+          import gzip, glob, json, os, shapefile
+          from shapely.geometry import shape, Point
+          from shapely.strtree import STRtree
+          UF = os.environ["UF"]
+          polys, attrs = [], []
+          for shp in glob.glob("shp/**/*.shp", recursive=True):
+              r = shapefile.Reader(shp, encoding="latin1")
+              names = [f[0] for f in r.fields[1:]]
+              print(shp, names)
+              for sr in r.iterShapeRecords():
+                  try: g = shape(sr.shape.__geo_interface__)
+                  except Exception: continue
+                  d = dict(zip(names, sr.record)); polys.append(g); attrs.append(d)
+          for js in glob.glob("wfs_*.json"):
+              try: fc = json.load(open(js, encoding="utf-8", errors="replace"))
+              except Exception as e: print("wfs invalido", js, e); continue
+              for f in fc.get("features", []):
+                  try: polys.append(shape(f["geometry"])); attrs.append(f.get("properties") or {})
+                  except Exception: pass
+          print("parcelas SIGEF:", len(polys))
+          if not polys: raise SystemExit("SIGEF nao baixou (veja o log do passo anterior)")
+          def pick(d, *ks):
+              low = {k.lower(): v for k, v in d.items()}
+              for k in ks:
+                  v = low.get(k)
+                  if v not in (None, ""): return str(v).replace("\t", " ").strip()
+              return ""
+          tree = STRtree(polys)
+          out = []
+          with gzip.open(f"car_{UF}.tsv.gz", "rt", encoding="utf-8") as f:
+              next(f)
+              for l in f:
+                  a = l.rstrip("\n").split("\t")
+                  if len(a) < 8 or not a[6]: continue
+                  p = Point(float(a[7]), float(a[6]))
+                  best = None
+                  for i in tree.query(p, predicate="intersects"):
+                      i = int(i); d = attrs[i]
+                      if best is None or polys[i].area < polys[best].area: best = i
+                  if best is None: continue
+                  d = attrs[best]
+                  out.append("\t".join([a[0], pick(d, "nome_area", "nome_imove", "nome", "denominaca"), pick(d, "registro_m", "matricula"),
+                                        pick(d, "codigo_imo", "cod_imovel", "sncr"), pick(d, "situacao_i", "status"), pick(d, "data_aprov", "data_certi")]))
+          with gzip.open(f"vinculo_{UF}.tsv.gz", "wt", encoding="utf-8") as g:
+              g.write("cod_imovel\tnome_fazenda\tmatricula\tcodigo_incra\tsituacao\tdata\n" + "\n".join(out) + "\n")
+          print("fazendas do CAR com nome no SIGEF:", len(out))
+          PYEOF
+      - name: Publicar
+        run: |
+          TAG="vinculo-$(date +%Y%m%d-%H%M)"
+          gh release create "$TAG" vinculo_*.tsv.gz --repo "$GITHUB_REPOSITORY" --title "Nome das fazendas $(date +%d/%m/%Y)" --notes "CAR x SIGEF/INCRA: nome da fazenda, matricula e codigo do imovel."
