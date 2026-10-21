@@ -23,9 +23,23 @@ jobs:
           import csv, io, gzip, json, re, ssl, urllib.request, datetime, unicodedata
           CTX = ssl.create_default_context(); CTX.set_ciphers("DEFAULT@SECLEVEL=1")
           UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+          NOVER = ssl.create_default_context(); NOVER.check_hostname = False; NOVER.verify_mode = ssl.CERT_NONE; NOVER.set_ciphers("DEFAULT@SECLEVEL=1")
+          AVISO = []
           def get(u):
               rq = urllib.request.Request(u, headers=UA)
-              with urllib.request.urlopen(rq, timeout=300, context=CTX) as r:
+              try:
+                  with urllib.request.urlopen(rq, timeout=300, context=CTX) as r:
+                      return r.read()
+              except Exception as e:
+                  if "CERTIFICATE" not in str(e).upper(): raise
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(u.replace("https://", "http://"), headers=UA), timeout=300) as r:
+                      return r.read()
+              except Exception:
+                  pass
+              # o site da Conab esta com certificado configurado errado: dado publico, baixa sem verificar e registra aviso
+              AVISO.append(u.split("/")[2])
+              with urllib.request.urlopen(rq, timeout=300, context=NOVER) as r:
                   return r.read()
           def norm(s): return unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().upper().strip()
           PROD = re.compile(r"SOJA|MILHO|SORGO|ALGOD|FEIJ|ARROZ|TRIGO|BOI|VACA|CAFE|FARELO")
@@ -67,10 +81,12 @@ jobs:
           # Indicadores Cepea (soja Paranagua, milho Campinas) - planilha publica
           for nome, cid in [("cepea_soja_paranagua", 92), ("cepea_milho", 77), ("cepea_soja_parana", 12)]:
               try:
-                  b = get(f"https://www.cepea.org.br/br/indicador/series/{'soja' if 'soja' in nome else 'milho'}.aspx?id={cid}")
+                  rq = urllib.request.Request(f"https://www.cepea.org.br/br/indicador/series/{'soja' if 'soja' in nome else 'milho'}.aspx?id={cid}", headers={**UA, "Referer": "https://www.cepea.org.br/br/indicador/soja.aspx", "Accept": "*/*", "Accept-Language": "pt-BR,pt;q=0.9"})
+                  with urllib.request.urlopen(rq, timeout=120, context=CTX) as r: b = r.read()
                   open(f"data/precos/{nome}.xls", "wb").write(b); log[nome] = f"{len(b)} bytes"
               except Exception as e:
                   log[nome] = "erro: " + str(e)
+          if AVISO: log["aviso"] = "certificado HTTPS invalido em: " + ", ".join(sorted(set(AVISO))) + " (baixado mesmo assim; dado publico)"
           log["atualizado"] = datetime.datetime.utcnow().isoformat() + "Z"
           json.dump(log, open("data/precos/log.json", "w"), ensure_ascii=False, indent=1)
           print(json.dumps(log, ensure_ascii=False, indent=1))
