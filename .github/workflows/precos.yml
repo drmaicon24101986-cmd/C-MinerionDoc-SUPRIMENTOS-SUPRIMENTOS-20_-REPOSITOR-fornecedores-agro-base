@@ -85,4 +85,5 @@ jobs:
           git rm -q --ignore-unmatch data/precos/*.tsv.gz data/precos/log.json
           git add data/precos
           git commit -m "Precos oficiais $(date +%Y-%m-%d)" || echo "sem mudancas"
-          git push
+          git pull --rebase -X theirs origin main || true
+          git push || (sleep 10 && git pull --rebase -X theirs origin main && git push)
