@@ -1,0 +1,84 @@
+name: Precos oficiais (Conab e Cepea)
+# Baixa os precos semanais/mensais pagos ao produtor por municipio (Conab, dados abertos)
+# e os indicadores Cepea de soja e milho, e salva em data/precos/ neste repositorio.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 11 * * 1-5"
+
+permissions:
+  contents: write
+
+jobs:
+  precos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Baixar e filtrar
+        run: |
+          mkdir -p data/precos
+          python3 - <<'PYEOF'
+          import csv, io, gzip, json, re, ssl, urllib.request, datetime, unicodedata
+          CTX = ssl.create_default_context(); CTX.set_ciphers("DEFAULT@SECLEVEL=1")
+          UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+          def get(u):
+              rq = urllib.request.Request(u, headers=UA)
+              with urllib.request.urlopen(rq, timeout=300, context=CTX) as r:
+                  return r.read()
+          def norm(s): return unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().upper().strip()
+          PROD = re.compile(r"SOJA|MILHO|SORGO|ALGOD|FEIJ|ARROZ|TRIGO|BOI|VACA|CAFE|FARELO")
+          base = "https://portaldeinformacoes.conab.gov.br/downloads/arquivos/"
+          log = {}
+          lim = (datetime.date.today() - datetime.timedelta(days=800)).isoformat()
+          for nome in ["PrecosSemanalMunicipio.txt", "PrecosMensalMunicipio.txt", "PrecosSemanalUF.txt", "PrecosMensalUF.txt"]:
+              try:
+                  b = get(base + nome)
+              except Exception as e:
+                  log[nome] = "erro: " + str(e); print(nome, e); continue
+              t = b.decode("utf-8", "replace") if b[:3] != b"\xef\xbb\xbf" else b[3:].decode("utf-8", "replace")
+              dl = ";" if t[:2000].count(";") > t[:2000].count("\t") else "\t"
+              rd = csv.reader(io.StringIO(t), delimiter=dl)
+              h = [norm(x).lower() for x in next(rd)]
+              print(nome, h)
+              ip = next((i for i, x in enumerate(h) if x.startswith("produto")), None)
+              keep = []
+              for r in rd:
+                  if len(r) != len(h): continue
+                  d = dict(zip(h, r))
+                  if ip is not None and not PROD.search(norm(r[ip])): continue
+                  dt = ""
+                  for k, v in d.items():
+                      if re.match(r"^\d{4}-\d{2}-\d{2}", v or "") or re.match(r"^\d{2}/\d{2}/\d{4}", v or ""):
+                          dt = v; break
+                  if dt:
+                      iso = dt[:10] if dt[4] == "-" else dt[6:10] + "-" + dt[3:5] + "-" + dt[0:2]
+                      if iso < lim: continue
+                  elif "ano" in d:
+                      try:
+                          if int(d["ano"]) < datetime.date.today().year - 2: continue
+                      except Exception: pass
+                  keep.append(r)
+              with gzip.open("data/precos/" + nome.replace(".txt", ".tsv.gz"), "wt", encoding="utf-8") as f:
+                  f.write("\t".join(h) + "\n")
+                  for r in keep: f.write("\t".join(x.replace("\t", " ") for x in r) + "\n")
+              log[nome] = f"{len(keep)} linhas"
+          # Indicadores Cepea (soja Paranagua, milho Campinas) - planilha publica
+          for nome, cid in [("cepea_soja_paranagua", 92), ("cepea_milho", 77), ("cepea_soja_parana", 12)]:
+              try:
+                  b = get(f"https://www.cepea.org.br/br/indicador/series/{'soja' if 'soja' in nome else 'milho'}.aspx?id={cid}")
+                  open(f"data/precos/{nome}.xls", "wb").write(b); log[nome] = f"{len(b)} bytes"
+              except Exception as e:
+                  log[nome] = "erro: " + str(e)
+          log["atualizado"] = datetime.datetime.utcnow().isoformat() + "Z"
+          json.dump(log, open("data/precos/log.json", "w"), ensure_ascii=False, indent=1)
+          print(json.dumps(log, ensure_ascii=False, indent=1))
+          PYEOF
+      - name: Salvar no repositorio
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/precos
+          git commit -m "Precos oficiais $(date +%Y-%m-%d)" || echo "sem mudancas"
+          git push
