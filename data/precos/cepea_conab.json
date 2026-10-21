@@ -1,0 +1,101 @@
+{
+ "cepea": {
+  "soja_paranagua": {
+   "erro": "Page.wait_for_selector: Timeout 90000ms exceeded.\nCall log:\nwaiting for locator(\"table\") to be visible\n"
+  },
+  "milho": [
+   [
+    [
+     "",
+     "VALOR R$*",
+     "VAR./DIA",
+     "VAR./MÊS",
+     "VALOR US$*"
+    ],
+    [
+     "20/10/2026",
+     "64,34",
+     "-0,62%",
+     "-6,31%",
+     "12,81"
+    ],
+    [
+     "19/10/2026",
+     "64,74",
+     "-0,17%",
+     "-5,72%",
+     "12,83"
+    ],
+    [
+     "16/10/2026",
+     "64,85",
+     "0,06%",
+     "-5,56%",
+     "12,78"
+    ],
+    [
+     "15/10/2026",
+     "64,81",
+     "-0,95%",
+     "-5,62%",
+     "12,71"
+    ],
+    [
+     "14/10/2026",
+     "65,43",
+     "-0,24%",
+     "-4,72%",
+     "12,99"
+    ],
+    [
+     "13/10/2026",
+     "65,59",
+     "-2,61%",
+     "-4,49%",
+     "13,06"
+    ],
+    [
+     "09/10/2026",
+     "67,35",
+     "0,25%",
+     "-1,92%",
+     "13,51"
+    ],
+    [
+     "08/10/2026",
+     "67,18",
+     "-0,09%",
+     "-2,17%",
+     "13,37"
+    ],
+    [
+     "07/10/2026",
+     "67,24",
+     "0,01%",
+     "-2,08%",
+     "13,42"
+    ],
+    [
+     "06/10/2026",
+     "67,23",
+     "-0,04%",
+     "-2,10%",
+     "13,50"
+    ],
+    [
+     "05/10/2026",
+     "67,26",
+     "-1,85%",
+     "-2,05%",
+     "13,49"
+    ]
+   ]
+  ],
+  "boi": {
+   "erro": "Page.wait_for_selector: Timeout 90000ms exceeded.\nCall log:\nwaiting for locator(\"table\") to be visible\n"
+  }
+ },
+ "conab_requisicoes": [],
+ "conab_texto": "Preços agrícolas, da sociobio e da pesca\nPreços médios semanais\nPreços médios mensais\nPeríodo restrito a 4 semanas por consulta.\nDados disponíveis a partir de 2014.\nAs informações podem ser reproduzidas, desde que citada a fonte Conab.\nProibida a comercialização das informações disponibilizadas.\n\n\nPeríodo\nPesquisar\n\n\n\nCOMPANHIA NACIONAL DE ABASTECIMENTO\n\nVersão 1.0.0",
+ "atualizado": "2026-10-21T15:34:03.316884Z"
+}
