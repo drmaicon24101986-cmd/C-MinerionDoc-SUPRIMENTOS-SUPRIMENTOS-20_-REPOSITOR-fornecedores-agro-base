@@ -13,6 +13,13 @@
      "VALOR US$*"
     ],
     [
+     "27/10/2026",
+     "64,87",
+     "0,98%",
+     "-5,53%",
+     "12,16"
+    ],
+    [
      "26/10/2026",
      "64,24",
      "-0,05%",
@@ -81,13 +88,6 @@
      "-2,61%",
      "-4,49%",
      "13,06"
-    ],
-    [
-     "09/10/2026",
-     "67,35",
-     "0,25%",
-     "-1,92%",
-     "13,51"
     ]
    ]
   ],
@@ -97,5 +97,5 @@
  },
  "conab_requisicoes": [],
  "conab_texto": "Preços agrícolas, da sociobio e da pesca\nPreços médios semanais\nPreços médios mensais\nPeríodo restrito a 4 semanas por consulta.\nDados disponíveis a partir de 2014.\nAs informações podem ser reproduzidas, desde que citada a fonte Conab.\nProibida a comercialização das informações disponibilizadas.\n\n\nPeríodo\nPesquisar\n\n\n\nCOMPANHIA NACIONAL DE ABASTECIMENTO\n\nVersão 1.0.0",
- "atualizado": "2026-10-27T16:48:26.806615Z"
+ "atualizado": "2026-10-28T17:17:17.920377Z"
 }
